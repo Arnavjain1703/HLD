@@ -729,3 +729,159 @@ S3 — us-west-2           ← origin, stores everything (150–300ms round trip
 ---
 
 *Document generated: 2026-08-10 | Source: Hello Interview — Design YouTube*
+
+---
+
+## 10. Detailed Internals — Q&A Supplement
+
+### 10.1 How Many Pre-Signed URLs Do We Need?
+
+It is pure math — driven by file size and part size.
+
+```
+number of parts     = ceil(fileSizeBytes / partSizeBytes)
+number of presigned URLs = number of parts  (one URL per part)
+```
+
+**S3 hard constraints:**
+
+| Constraint | Value |
+|------------|-------|
+| Minimum part size | 5 MB (except last part) |
+| Maximum part size | 5 GB |
+| Maximum number of parts | 10,000 |
+
+**Part size calculation:**
+
+```python
+def calculate_part_size(file_size_bytes: int) -> int:
+    MIN_PART_SIZE = 5 * 1024 * 1024    # 5 MB
+    MAX_PARTS     = 10_000
+
+    part_size = MIN_PART_SIZE
+    while file_size_bytes / part_size > MAX_PARTS:
+        part_size *= 2                 # double until fits under 10,000 parts
+    return part_size
+```
+
+**Real examples:**
+
+```
+50 MB file   → partSize =  5 MB → 10   pre-signed URLs
+1 GB file    → partSize =  5 MB → 205  pre-signed URLs
+10 GB file   → partSize =  5 MB → 2048 pre-signed URLs
+50 GB file   → partSize = 10 MB → 5120 pre-signed URLs
+256 GB file  → partSize = 32 MB → 8192 pre-signed URLs
+```
+
+**Important:** `generate_presigned_url` is computed **locally by the AWS SDK** using your server's IAM credentials. It never makes a network call to S3 — just a local HMAC-SHA256 signing operation. Generating 8192 URLs for a 256 GB file is fast.
+
+---
+
+### 10.2 What Ties All Parts to One Video? — The `uploadId`
+
+S3 does NOT automatically group parts. The `uploadId` is the session key that ties everything together.
+
+```
+CreateMultipartUpload
+    │
+    └── S3 creates internal session:
+        uploadId: "VXBsb2FkIElEIGZvciA2aGVsbG8"
+        ├── key:    "raw/abc123.mp4"
+        ├── part-1: (pending)
+        ├── part-2: (pending)
+        └── part-N: (pending)
+```
+
+Every pre-signed URL is stamped with this `uploadId` + a `partNumber`. So:
+- A URL for part 3 **cannot** be used to upload part 1
+- Two simultaneous video uploads have different `uploadId`s — completely isolated
+
+Parts can arrive **out of order** — S3 stages them and assembles strictly by `PartNumber` when `CompleteMultipartUpload` is called, not by arrival order.
+
+---
+
+### 10.3 Are Parts Combined After Upload? — Yes, By S3
+
+`CompleteMultipartUpload` physically concatenates all parts into one continuous object:
+
+```
+Before (staged, invisible):
+  part-1: [bytes 0    → 32 MB]
+  part-2: [bytes 32   → 64 MB]
+  part-3: [bytes 64   → 96 MB]
+  part-4: [bytes 96   → 110 MB]
+
+After (one S3 object):
+  raw/abc123.mp4 → [bytes 0 → 110 MB, continuous]
+  ↑ indistinguishable from a regular single PUT upload
+  ↑ staging parts deleted automatically by S3
+```
+
+S3 verifies every ETag before merging. If any ETag mismatches → `CompleteMultipartUpload` fails → no object created, no partial file left behind.
+
+---
+
+### 10.4 What Happens After Chunking?
+
+Five steps run sequentially after the raw video is assembled in S3:
+
+```
+STEP 1 — CHUNK
+  FFmpeg splits raw.mp4 into 6s .ts segments at keyframes
+  chunk_000.ts, chunk_001.ts ... chunk_N.ts
+
+STEP 2 — TRANSCODE (parallel per resolution)
+  Each chunk → 5 transcoders simultaneously
+  chunk_000.ts → chunk_000_240p.ts
+              → chunk_000_720p.ts
+              → chunk_000_1080p.ts  ...
+
+STEP 3 — STORE + DELETE
+  Transcoded chunks uploaded to S3 under processed/abc123/
+  Raw file raw/abc123.mp4 DELETED (save storage cost)
+
+STEP 4 — GENERATE MANIFEST
+  Per-resolution manifest: ordered list of chunk URLs
+  Master manifest: maps each resolution to its manifest
+
+STEP 5 — UPDATE DB + CDN
+  status = READY
+  manifestFileUrl = cdn.example.com/abc123/master.m3u8
+  CDN pre-warmed with manifest + first few popular chunks
+```
+
+---
+
+### 10.5 Are Streaming Chunks Ever Recombined? — No, Never
+
+Upload parts get combined. Streaming chunks do not. They are opposite operations:
+
+| | Upload Parts | Streaming Chunks |
+|---|---|---|
+| Combined? | ✅ Yes — S3 merges into one file | ❌ No — stay separate forever |
+| Where joined? | S3 via `CompleteMultipartUpload` | Never — player stitches in memory during playback only |
+| After joining? | Staging parts deleted | N/A |
+| Purpose | Overcome upload size limits | Fast start + adaptive bitrate |
+
+Chunks stay as individual files in S3 forever and are served one by one:
+
+```
+S3 stores permanently:
+  processed/abc123/720p/chunk_000.ts   ← 6s clip, lives forever
+  processed/abc123/720p/chunk_001.ts   ← 6s clip, lives forever
+  processed/abc123/720p/chunk_002.ts   ← 6s clip, lives forever
+
+Client receives one at a time:
+  t=0s  → chunk_000.ts plays
+  t=4s  → chunk_001.ts fetched (buffered ahead)
+  t=10s → chunk_002.ts fetched
+  → seamless playback, stitched in memory only, never on disk or S3
+```
+
+The raw file is the only thing that gets assembled and then deleted.
+The processed chunks are the permanent form of the video.
+
+---
+
+*Last updated: 2026-08-10*
