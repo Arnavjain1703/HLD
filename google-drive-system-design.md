@@ -76,10 +76,6 @@ All APIs require user authentication over HTTPS.
 
 ### 3.1 Upload a File
 
-Two upload modes:
-- **Simple upload** — small files
-- **Resumable upload** — large files or unreliable networks
-
 ```
 POST https://api.example.com/files/upload?uploadType=resumable
 Params:
@@ -113,94 +109,121 @@ Params:
 
 ## 4. High-Level Design Evolution
 
-### Stage 1 — Single Server
+### Stage 1 — Directory Namespace (Figure 15-3)
 
-Start simple: Apache web server + MySQL + `/drive` directory.
+```mermaid
+graph TD
+    drive[/drive]
+    u1[/user1]
+    u2[/user2]
+    u3[/user3]
+    recipes[/recipes]
+    chicken[chicken_soup.txt]
+    football[football.mov]
+    sports[sports.txt]
+    pic[best_pic_ever.png]
 
-```
-/drive
-  /user1
-    /recipes
-      chicken_soup.txt
-  /user2
-    football.mov
-    sports.txt
-  /user3
-    best_pic_ever.png
-```
-
-> Figure 15-3: Drive directory namespace
-
-### Stage 2 — Storage Full → Shard the DB
-
-```
-+--------------------------------------+
-|  /drive       [10 MB free of 1 TB]   |  <- disk full!
-+--------------------------------------+
+    drive --> u1
+    drive --> u2
+    drive --> u3
+    u1 --> recipes
+    recipes --> chicken
+    u2 --> football
+    u2 --> sports
+    u3 --> pic
 ```
 
-> Figure 15-4: Single server storage full
+### Stage 2 — Storage Full, Shard by user_id (Figures 15-4, 15-5)
 
-Shard by `user_id`:
+```mermaid
+graph TD
+    disk["/drive — 10 MB free of 1 TB ⚠️ FULL"]
+    hash{"user_id % 4"}
+    s1[Server 1]
+    s2[Server 2]
+    s3[Server 3]
+    s4[Server 4]
 
-```
-          user_id % 4
-         /    |    |    \
-     Server1 Server2 Server3 Server4
-```
-
-> Figure 15-5: DB sharding by user_id
-
-### Stage 3 — Move Files to S3
-
-```
-Same-region replication:           Cross-region replication:
-
-  Bucket                            Region A (Bucket)
-    +-- replica                           |
-    +-- replica            --------->  Region B (Bucket)
-    +-- replica                           +-- replica
-  (all in Region A)                       +-- replica
+    disk -->|"solution: shard"| hash
+    hash -->|"0"| s1
+    hash -->|"1"| s2
+    hash -->|"2"| s3
+    hash -->|"3"| s4
 ```
 
-> Figure 15-6: S3 same-region vs cross-region replication
+### Stage 3 — S3 Replication (Figure 15-6)
 
-### Stage 4 — Decouple Everything
+```mermaid
+graph LR
+    subgraph same["Same-Region Replication (Region A)"]
+        b1[Bucket]
+        r1[Replica]
+        r2[Replica]
+        r3[Replica]
+        b1 -->|replication| r1
+        b1 -->|replication| r2
+        b1 -->|replication| r3
+    end
 
+    subgraph cross["Cross-Region Replication"]
+        subgraph ra["Region A"]
+            ba[Bucket]
+        end
+        subgraph rb["Region B"]
+            bb[Bucket]
+            rb1[Replica]
+            rb2[Replica]
+        end
+        ba -->|replication| bb
+        bb -->|replication| rb1
+        bb -->|replication| rb2
+    end
 ```
-       User (Browser / Mobile)
-                |
-          Load balancer
-                |
-           API servers
-          /             \
-   Metadata DB        File storage (S3)
-```
 
-> Figure 15-7: Decoupled architecture
+### Stage 4 — Decoupled Architecture (Figure 15-7)
+
+```mermaid
+graph TD
+    user["👤 User\n(Browser / Mobile)"]
+    lb[Load Balancer]
+    api[API Servers]
+    db[(Metadata DB)]
+    fs[(File Storage\nAmazon S3)]
+
+    user --> lb
+    lb --> api
+    api --> db
+    api --> fs
+```
 
 ---
 
-## 5. Detailed Architecture
+## 5. Detailed Architecture — Full High-Level Design (Figure 15-10)
 
-```
-                   User
-             (Browser / Mobile)
-                    |
-              Load balancer
-                    |
-              API servers <--------- long polling
-             /      |      \               |
-     Block        Metadata    Notification
-     servers        DB         Service -----> Offline Backup Queue
-        |           |
-   Cloud          Metadata
-   storage          Cache
-        |
-   Cold storage
-```
+```mermaid
+graph TD
+    user["👤 User\n(Browser / Mobile)"]
+    lb[Load Balancer]
+    api[API Servers]
+    bs[Block Servers]
+    cs[(Cloud Storage\nS3)]
+    cold[(Cold Storage\nS3 Glacier)]
+    mdb[(Metadata DB)]
+    mc[(Metadata Cache\nRedis)]
+    ns[Notification Service]
+    obq[Offline Backup Queue]
 
-> Figure 15-10: Full high-level design
+    user -->|HTTPS| lb
+    lb --> api
+    api -->|upload blocks| bs
+    api -->|read/write metadata| mdb
+    api -->|read cache| mc
+    api -->|long polling| ns
+    bs -->|store blocks| cs
+    cs -->|cold tier| cold
+    ns -->|push changes| obq
+    ns -->|notify clients| user
+```
 
 ### Component Summary
 
@@ -220,200 +243,230 @@ Same-region replication:           Cross-region replication:
 
 ## 6. Deep Dive: Block Servers
 
-For large frequently updated files, uploading the whole file every time wastes bandwidth.
+### Block Server Upload Pipeline — New File (Figure 15-11)
 
-### Delta Sync — Only Modified Blocks Transferred
+```mermaid
+graph LR
+    file[📄 File]
+    subgraph bs[Block Servers]
+        split1[Split → Block 1]
+        split2[Split → Block 2]
+        splitn[Split → Block N]
+        comp1[Compress]
+        comp2[Compress]
+        compn[Compress]
+        enc1[Encrypt 🔒]
+        enc2[Encrypt 🔒]
+        encn[Encrypt 🔒]
+    end
+    cs[(Cloud Storage)]
 
+    file --> split1 --> comp1 --> enc1 --> cs
+    file --> split2 --> comp2 --> enc2 --> cs
+    file --> splitn --> compn --> encn --> cs
 ```
-Block servers (10 blocks):          Cloud storage:
-
-+----------+----------+
-| Block 1  | Block 2  |<-- changed        Block 2
-|          |(modified)| ------------>
-+----------+----------+                   Block 5
-| Block 3  | Block 4  |
-+----------+----------+
-| Block 5  | Block 6  |<-- changed
-|(modified)|          |
-+----------+----------+
-| Block 7  | Block 8  |
-+----------+----------+
-| Block 9  | Block 10 |
-+----------+----------+
-```
-
-> Figure 15-12: Delta sync — only Block 2 and Block 5 transferred
-
-### Compression
-- Text files → **gzip / bzip2**
-- Images and videos → format-specific algorithms
-
-### Block Server Upload Pipeline (new file)
-
-```
-         +--split--> Block 1 --compress--> [  ] --encrypt--> [lock] --+
-File ----|--split--> Block 2 --compress--> [  ] --encrypt--> [lock] --|--> Cloud storage
-         |   ...                                                       |
-         +--split--> Block N --compress--> [  ] --encrypt--> [lock] --+
-```
-
-> Figure 15-11: Block server pipeline
 
 Block size limit: **4 MB** (Dropbox reference)
 
+### Delta Sync — Only Modified Blocks Transferred (Figure 15-12)
+
+```mermaid
+graph LR
+    subgraph bsrv[Block Servers]
+        b1[Block 1]
+        b2[Block 2\n✏️ modified]
+        b3[Block 3]
+        b4[Block 4]
+        b5[Block 5\n✏️ modified]
+        b6[Block 6]
+        b7[Block 7]
+        b8[Block 8]
+        b9[Block 9]
+        b10[Block 10]
+    end
+    cs[(Cloud Storage)]
+
+    b2 -->|"changed only"| cs
+    b5 -->|"changed only"| cs
+```
+
+### Compression Algorithms
+- Text files → **gzip / bzip2**
+- Images and videos → format-specific algorithms
+
 ---
 
-## 7. Metadata Database Schema
+## 7. Metadata Database Schema (Figure 15-13)
 
 > **Why Relational DB (not NoSQL)?**
-> Strong consistency (ACID) is required — the same file must look identical to all clients at all times. NoSQL defaults to eventual consistency, which would require complex application-level sync logic to work around. Relational DB gives ACID natively.
+> Strong consistency (ACID) is required — the same file must look identical to all clients at all times. NoSQL defaults to eventual consistency. Relational DB gives ACID natively without application-layer workarounds.
 
-```
-+-------------------+       +---------------------+
-|       user        |       |        file         |
-|-------------------|       |---------------------|
-| user_id    bigint |--+    | id           bigint |
-| user_name  varchar|  |    | file_name    varchar |
-| created_at        |  |    | relative_path varchar|
-+-------------------+  |    | is_directory boolean |
-                       |    | latest_version bigint|
-+-------------------+  |    | checksum     bigint  |
-|      device       |  |    | workspace_id bigint  |
-|-------------------|  |    | created_at           |
-| device_id  uuid   |  |    | last_modified        |
-| user_id    bigint |--+    +---------------------+
-| last_logged_in    |
-+-------------------+       +---------------------+
-                            |    file_version      |
-+-------------------+       |---------------------|
-|     workspace     |       | id            bigint|
-|-------------------|       | file_id       bigint|
-| id         bigint |       | device_id     uuid  |
-| owner_id   bigint |       | version_number bigint|
-| is_shared  boolean|       | last_modified        |
-| created_at        |       +---------------------+
-+-------------------+
-                            +---------------------+
-                            |       block         |
-                            |---------------------|
-                            | block_id      bigint|
-                            | file_version_id     |
-                            | block_order   int   |
-                            +---------------------+
-```
+```mermaid
+erDiagram
+    USER {
+        bigint user_id PK
+        varchar user_name
+        timestamp created_at
+    }
+    DEVICE {
+        uuid device_id PK
+        bigint user_id FK
+        timestamp last_logged_in
+    }
+    WORKSPACE {
+        bigint id PK
+        bigint owner_id FK
+        boolean is_shared
+        timestamp created_at
+    }
+    FILE {
+        bigint id PK
+        varchar file_name
+        varchar relative_path
+        boolean is_directory
+        bigint latest_version
+        bigint checksum
+        bigint workspace_id FK
+        timestamp created_at
+        timestamp last_modified
+    }
+    FILE_VERSION {
+        bigint id PK
+        bigint file_id FK
+        uuid device_id FK
+        bigint version_number
+        timestamp last_modified
+    }
+    BLOCK {
+        bigint block_id PK
+        bigint file_version_id FK
+        int block_order
+    }
 
-> Figure 15-13: Metadata DB schema
+    USER ||--o{ DEVICE : "has"
+    USER ||--o{ WORKSPACE : "owns"
+    WORKSPACE ||--o{ FILE : "contains"
+    FILE ||--o{ FILE_VERSION : "has revisions"
+    FILE_VERSION ||--o{ BLOCK : "consists of"
+```
 
 ### Table Purpose Reference
 
 | Table | Purpose |
 |---|---|
 | **user** | Basic user info: username, email, profile photo |
-| **device** | Device info; push_id for mobile notifications. One user can have multiple devices |
+| **device** | Device info; push_id for mobile notifications. One user → multiple devices |
 | **workspace** | Root directory; can be shared |
 | **file** | Latest file state |
 | **file_version** | Immutable revision history; rows never updated after insert |
-| **block** | One row per block; reconstruct any version by fetching all blocks for a file_version_id ordered by block_order |
+| **block** | Reconstruct any version by fetching all blocks for a `file_version_id` sorted by `block_order` |
 
 ---
 
-## 8. Upload Flow
+## 8. Upload Flow (Figure 15-14)
 
-> Figure 15-14: Upload sequence diagram
+Two requests sent **in parallel** from Client 1: add metadata + upload content.
 
-Two requests sent **in parallel** from Client 1:
+```mermaid
+sequenceDiagram
+    participant C1 as Client 1
+    participant BS as Block Servers
+    participant CS as Cloud Storage
+    participant API as API Servers
+    participant MDB as Metadata DB
+    participant NS as Notification Service
+    participant C2 as Client 2
 
+    par Add file metadata
+        C1->>API: 1. add file metadata
+        API->>MDB: 2. store metadata, status=PENDING
+        API->>NS: 3. notify: file being added
+        NS-->>C2: 4. notify changes
+    and Upload file content
+        C1->>BS: 2.1 upload file
+        BS->>CS: 2.2 upload blocks (chunked, compressed, encrypted)
+        CS-->>API: 2.3 upload complete callback
+        API->>MDB: 2.4 update status=UPLOADED
+        API->>NS: 2.5 notify: file uploaded
+        NS-->>C2: 2.6 notify changes
+    end
 ```
-Client 1     Block servers   Cloud storage   API servers   Metadata DB   Notification svc
-   |                                              |
-   |---(1) add file metadata-------------------->|
-   |                                              |---(2) store metadata, status=PENDING--->|
-   |                                              |---(3) notify changes------------------------------------>|
-   |                                              |    (Client 2 notified: file being added)
-   |---(2.1) upload file--->|
-   |                        |---(2.2) upload blocks--->|
-   |                                              |<---(2.3) upload complete callback-----------|
-   |                                              |---(2.4) update metadata: status=UPLOADED--->|
-   |                                              |---(2.5) notify changes------------------------------------>|
-```
-
-### Steps
-1. Client 1 adds file metadata → API servers → Metadata DB sets status = **"pending"**
-2. Notification service informed → notifies Client 2 a file is being added
-3. Client 1 uploads content to block servers
-4. Block servers chunk → compress → encrypt → upload blocks to cloud storage
-5. Cloud storage triggers upload completion callback to API servers
-6. File status updated to **"uploaded"** in Metadata DB
-7. Notification service notifies all relevant clients the file is fully uploaded
 
 ---
 
-## 9. Download Flow
+## 9. Download Flow (Figure 15-15)
 
-> Figure 15-15: Download sequence diagram
+```mermaid
+sequenceDiagram
+    participant C2 as Client 2
+    participant BS as Block Servers
+    participant CS as Cloud Storage
+    participant API as API Servers
+    participant MDB as Metadata DB
+    participant NS as Notification Service
 
-Triggered when a file is added or edited by another client.
+    NS-->>C2: 1. notify changes (file changed elsewhere)
+    C2->>API: 2. get changes (fetch metadata)
+    API->>MDB: 3. get changes
+    MDB-->>API: 4. return changes
+    API-->>C2: 5. metadata returned
+    C2->>BS: 6. download blocks
+    BS->>CS: 7. download blocks from cloud
+    CS-->>BS: 8. blocks returned
+    BS-->>C2: 9. blocks returned
+    Note over C2: reconstruct file from blocks
+```
 
 **How does a client know a file changed?**
 - **Online** → notification service informs the client; client pulls latest changes
 - **Offline** → changes cached in offline backup queue; client pulls when back online
 
-```
-Client 2     Block servers   Cloud storage   API servers   Metadata DB   Notification svc
-   |                                                                          |
-   |<--(1) notify changes-----------------------------------------------------|
-   |---(2) get changes------------------------------------------------>|
-   |                                                                   |---(3) get changes--->|
-   |                                                                   |<--(4) return changes--|
-   |<--(5) metadata returned-------------------------------------------|
-   |---(6) download blocks--->|
-   |                          |---(7) download blocks--->|
-   |                          |<--(8) blocks returned----|
-   |<--(9) blocks returned----|
-   (reconstruct file from blocks)
-```
-
 ---
 
 ## 10. Notification Service
-
-Purpose: notify clients of file changes made by other clients to minimize sync conflicts.
 
 ### Long Polling vs WebSocket
 
 | Option | Best For | Google Drive? |
 |---|---|---|
-| **Long polling** | Infrequent, unidirectional server→client | Chosen |
-| **WebSocket** | Real-time bi-directional (chat, gaming) | Overkill |
+| **Long polling** | Infrequent, unidirectional server→client | ✅ Chosen |
+| **WebSocket** | Real-time bi-directional (chat, gaming) | ❌ Overkill |
 
 **Why long polling?**
 - File change notifications are infrequent — no continuous data burst
-- The flow is unidirectional (server tells client about changes; client does not push back)
+- The flow is unidirectional (server tells client about changes)
 - WebSocket is purpose-built for chat-style apps, not file sync
 - Dropbox uses the same approach
 
-### How Long Polling Works
-1. Each client opens a persistent long poll connection to notification service
-2. On file change detection, connection is closed; client connects to API servers to download latest changes
-3. After response received or timeout, client immediately sends a new long poll request
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant NS as Notification Service
+    participant API as API Servers
+
+    C->>NS: open long poll connection
+    Note over NS: waiting for changes...
+    NS-->>C: file changed! (close connection)
+    C->>API: pull latest metadata
+    API-->>C: metadata returned
+    C->>NS: open new long poll connection
+```
 
 ---
 
 ## 11. Save Storage Space
 
-Multiple versions of the same file stored across multiple data centers fills storage fast.
+```mermaid
+graph TD
+    problem["Storage fills up\n(500 PB at scale)"]
+    d1["1. De-duplicate blocks\n(same hash = same block)"]
+    d2["2. Cap version history\n(drop oldest when limit hit)"]
+    d3["3. Cold storage tiering\n(inactive files → S3 Glacier\n~10× cheaper)"]
 
-### Strategy 1 — De-duplicate Data Blocks
-- Two blocks are identical if they have the **same hash value**
-- Identical blocks across users and versions → stored once
-
-### Strategy 2 — Intelligent Backup Limits
-- **Version cap** — limit stored revisions; oldest replaced when cap is reached
-- **Weight recent versions** — a heavily edited doc might be saved 1000+ times in a day; recent versions matter more
-
-### Strategy 3 — Cold Storage Tiering
-- Files not accessed for months/years → **Amazon S3 Glacier**
-- S3 Glacier is ~10× cheaper than S3 Standard
+    problem --> d1
+    problem --> d2
+    problem --> d3
+```
 
 ---
 
@@ -428,7 +481,7 @@ Multiple versions of the same file stored across multiple data centers fills sto
 | **Metadata cache** | Node goes down | Other replicas serve; new node spun up |
 | **Metadata DB master** | Goes down | Promote slave to master; bring up new slave |
 | **Metadata DB slave** | Goes down | Use other slaves for reads; replace failed slave |
-| **Notification service** | Server fails | 1M+ long poll connections drop; clients gradually reconnect to a different server |
+| **Notification service** | Server fails | 1M+ long poll connections drop; clients gradually reconnect to different server |
 | **Offline backup queue** | Queue fails | Queues are replicated; consumers re-subscribe |
 
 ---
@@ -437,18 +490,24 @@ Multiple versions of the same file stored across multiple data centers fills sto
 
 ### Alternative: Upload Directly to Cloud (Bypass Block Servers)
 
-| Aspect | Block Servers (Current Design) | Direct to Cloud |
+```mermaid
+graph LR
+    subgraph current["Current Design"]
+        c1[Client] -->|upload| cbs[Block Servers] -->|blocks| ccs[Cloud Storage]
+    end
+    subgraph alt["Alternative"]
+        a1[Client] -->|upload direct| acs[Cloud Storage]
+    end
+```
+
+| Aspect | Block Servers (Current) | Direct to Cloud |
 |---|---|---|
 | Upload speed | Slightly slower (extra hop) | Faster — file transferred once |
 | Logic location | Centralized in block servers | Must re-implement on iOS, Android, Web |
 | Security | Server-side encryption (safer) | Client-side encryption (risky) |
 | Maintenance | Single codebase | Three platform implementations |
 
-**Verdict**: Block servers are better — centralized security and maintainability win.
-
-### Alternative: Separate Presence Service
-- Extract online/offline detection from notification servers into a dedicated **Presence Service**
-- Benefit: reusable by other services (chat, analytics, etc.)
+**Verdict**: Block servers win — centralized security and maintainability.
 
 ---
 
@@ -460,16 +519,16 @@ Multiple versions of the same file stored across multiple data centers fills sto
 
 **Core issue: consistency.**
 
-The system needs **strong consistency** — the same file must look identical to all clients simultaneously. If User A uploads a file and User B sees a stale version on a different device, that is a critical correctness bug.
+The system needs **strong consistency** — the same file must look identical to all clients simultaneously.
 
-- **Relational DB (MySQL/PostgreSQL)**: ACID is natively supported — atomicity, consistency, isolation, durability are guaranteed
-- **NoSQL (DynamoDB, Cassandra, MongoDB)**: defaults to eventual consistency — different replicas can hold different values at the same moment in time
-- To use NoSQL here, you would need to implement consistency guarantees in application-layer synchronization logic — complex, error-prone, and re-inventing what SQL gives for free
+- **Relational DB (MySQL/PostgreSQL)**: ACID natively supported — consistency guaranteed
+- **NoSQL (DynamoDB, Cassandra, MongoDB)**: defaults to eventual consistency — replicas can diverge momentarily
+- To use NoSQL, you would implement consistency in application-layer sync logic — complex and error-prone
 
 **Scaling the relational DB:**
-- **Read replicas** — horizontal read scaling (1:1 read:write from estimation)
+- **Read replicas** for horizontal read scaling (1:1 read:write ratio)
 - **Sharding** on `user_id` or `workspace_id` for write scaling
-- **Metadata cache** (Redis) for hot data — always invalidate on write
+- **Metadata cache** (Redis) for hot data — always invalidate cache on write
 
 ---
 
@@ -480,7 +539,6 @@ Metadata (file paths, version numbers, checksums) is read far more often than wr
 **Consistency rule:**
 - On every DB write → invalidate or update the corresponding cache entry
 - Cache and DB master must always hold the same value
-- This ensures strong consistency even with a caching layer
 
 ---
 
@@ -496,7 +554,7 @@ Metadata (file paths, version numbers, checksums) is read far more often than wr
 
 ### Q4: Why split files into blocks instead of storing whole files?
 
-- **Delta sync** — only modified blocks transferred on update → saves bandwidth
+- **Delta sync** — only modified blocks transferred on update → bandwidth savings
 - **Parallel upload** — blocks uploaded concurrently → faster
 - **Resumability** — interrupted upload resumes from last successful block, not from scratch
 - **De-duplication** — identical blocks (same hash) stored once, shared across users and versions
@@ -515,10 +573,10 @@ Metadata (file paths, version numbers, checksums) is read far more often than wr
 ### Q6: How are sync conflicts handled?
 
 **First write wins:**
-1. First version processed by the system → saved as canonical version
+1. First version processed → saved as canonical version
 2. Later conflicting version → flagged as a conflict copy
 3. User presented with both copies → option to merge or override
-4. Example conflict copy name: `SystemDesignInterview_user2_conflicted_copy_2019-05-01`
+4. Example: `SystemDesignInterview_user2_conflicted_copy_2019-05-01`
 
 ---
 
@@ -533,7 +591,7 @@ Metadata (file paths, version numbers, checksums) is read far more often than wr
 
 ### Q8: How do you reduce storage costs at 500 PB scale?
 
-1. **Block de-duplication** — identical hash = shared block storage across users
+1. **Block de-duplication** — identical hash = shared block storage
 2. **Versioning caps** — limit stored revisions; oldest dropped at cap
 3. **Cold storage tiering** — inactive files → S3 Glacier (~10× cheaper than S3 Standard)
 
@@ -542,20 +600,19 @@ Metadata (file paths, version numbers, checksums) is read far more often than wr
 ### Q9: What are the most interesting DB schema decisions?
 
 - **`file_version` rows are immutable** — never updated after insert; preserves revision history integrity
-- **`block` has `block_order`** — reconstruct any file version by fetching all blocks for a `file_version_id` sorted by `block_order`
+- **`block` has `block_order`** — reconstruct any file version by fetching blocks for a `file_version_id` sorted by `block_order`
 - **`checksum` on `file`** — enables de-duplication and integrity verification
-- **Separate `device` table** — one user can have multiple devices; push notifications are device-scoped, not user-scoped
-- **`file` vs `file_version`** — `file` = current state; `file_version` = immutable history; clean separation of concerns
+- **Separate `device` table** — one user can have multiple devices; push notifications are device-scoped
+- **`file` vs `file_version`** — `file` = current state; `file_version` = immutable history
 
 ---
 
 ### Q10: Why are two requests sent in parallel during upload?
 
-When Client 1 uploads:
 1. **Metadata flow**: Client → API servers → Metadata DB (store entry, status = "pending")
 2. **Content flow**: Client → Block servers → Cloud storage
 
-They are independent — metadata storage does not depend on content upload completing. Parallelism minimizes total upload latency. Final status is set to "uploaded" only after cloud storage confirms completion.
+They are independent — metadata storage does not depend on content upload completing. Parallelism minimizes total upload latency. Final status set to "uploaded" only after cloud storage confirms completion.
 
 ---
 
@@ -563,7 +620,7 @@ They are independent — metadata storage does not depend on content upload comp
 
 - Resumable uploads become even more critical
 - S3 multipart upload natively handles files up to 5 TB
-- Block size might be tuned upward to reduce block count per file
+- Block size tuned upward to reduce block count per file
 - Block servers need higher parallelism in the pipeline
 - `block` table may need partitioning by `file_version_id` at extreme scale
 
